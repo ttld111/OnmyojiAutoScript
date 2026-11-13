@@ -71,6 +71,9 @@ def retry(func):
 
 
 class Scrcpy(ScrcpyCore, Uiautomator2):
+    FRAME_WAIT = 0.25
+    FIRST_FRAME_TIMEOUT = 3.0
+
     def _scrcpy_resolution_check(self):
         if not self._scrcpy_alive:
             with self._scrcpy_control_socket_lock:
@@ -82,15 +85,23 @@ class Scrcpy(ScrcpyCore, Uiautomator2):
         self.scrcpy_ensure_running()
 
         with self._scrcpy_control_socket_lock:
-            # Wait new frame
             now = time.time()
+            # Static pages do not necessarily produce encoder frames. Wait
+            # briefly for a transition frame, then reuse the latest image.
+            wait = self.FIRST_FRAME_TIMEOUT if self._scrcpy_last_frame is None else self.FRAME_WAIT
+            deadline = time.monotonic() + wait
             while 1:
-                time.sleep(0.001)
+                time.sleep(0.002)
                 if self._scrcpy_stream_loop_thread is None or not self._scrcpy_stream_loop_thread.is_alive():
                     raise ScrcpyError('_scrcpy_stream_loop_thread died')
                 if self._scrcpy_last_frame_time > now:
                     screenshot = self._scrcpy_last_frame.copy()
                     return screenshot
+                if self._scrcpy_last_frame is not None and time.monotonic() >= deadline:
+                    logger.info('Scrcpy produced no new frame, reuse the last frame')
+                    return self._scrcpy_last_frame.copy()
+                if time.monotonic() >= deadline:
+                    raise ScrcpyError('Wait scrcpy first frame timeout')
 
     @retry
     def click_scrcpy(self, x, y):

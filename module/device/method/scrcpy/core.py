@@ -13,7 +13,6 @@ from module.base.timer import Timer
 from module.device.connection import Connection
 from module.device.method.scrcpy.control import ControlSender
 from module.device.method.scrcpy.options import ScrcpyOptions
-from module.device.method.utils import recv_all
 from module.exception import RequestHumanTakeover
 from module.logger import logger
 
@@ -32,6 +31,7 @@ class ScrcpyCore(Connection):
     _scrcpy_last_frame_time: float = 0.
 
     _scrcpy_alive = False
+    _scrcpy_initialized = False
     _scrcpy_server_stream: t.Optional[_AdbStreamConnection] = None
     _scrcpy_video_socket: t.Optional[socket.socket] = None
     _scrcpy_control_socket: t.Optional[socket.socket] = None
@@ -44,18 +44,60 @@ class ScrcpyCore(Connection):
     def _scrcpy_control(self) -> ControlSender:
         return ControlSender(self)
 
+    @property
+    def _scrcpy_jar_local(self) -> str:
+        # Fall back to the bundled jar in case config_manual.py was not updated.
+        return self.config.SCRCPY_FILEPATH_LOCAL or './bin/scrcpy/scrcpy-server-v1.20.jar'
+
+    @property
+    def _scrcpy_jar_remote(self) -> str:
+        return self.config.SCRCPY_FILEPATH_REMOTE or '/data/local/tmp/scrcpy-server.jar'
+
     def scrcpy_init(self):
+        self._scrcpy_initialized = False
+        if not self.config.SCRCPY_FILEPATH_LOCAL or not self.config.SCRCPY_FILEPATH_REMOTE:
+            logger.warning(
+                'SCRCPY_FILEPATH_LOCAL or SCRCPY_FILEPATH_REMOTE is not set, '
+                'using the bundled scrcpy-server-v1.20.jar'
+            )
         self._scrcpy_server_stop()
+        self._scrcpy_server_kill_stale()
 
         logger.hr('Scrcpy init')
-        logger.info(f'pushing {self.config.SCRCPY_FILEPATH_LOCAL}')
-        self.adb_push(self.config.SCRCPY_FILEPATH_LOCAL, self.config.SCRCPY_FILEPATH_REMOTE)
+        logger.info(f'pushing {self._scrcpy_jar_local}')
+        self.adb_push(self._scrcpy_jar_local, self._scrcpy_jar_remote)
+        # Host archives may preserve a restrictive source mode on this file.
+        # app_process runs as shell and cannot load a 0000-mode jar.
+        self.adb_shell(['chmod', '644', self._scrcpy_jar_remote])
 
         self._scrcpy_alive = False
+        self._scrcpy_initialized = True
         self.scrcpy_ensure_running()
+
+    def _scrcpy_server_kill_stale(self):
+        """
+        Kill leftover scrcpy server processes on the device.
+
+        If a previous scrcpy session crashed without a clean shutdown, the old
+        server process keeps the abstract socket bound, so the new server aborts
+        with "Address already in use". Only kill processes running scrcpy.Server.
+        """
+        logger.info('Kill stale scrcpy server on device')
+        try:
+            self.adb_shell(
+                'ps -A -o PID,NAME,ARGS | awk '
+                '\'$2=="app_process" || $2=="app_process32" || $2=="app_process64" '
+                '{if ($0 ~ /com.genymobile.scrcpy.Server/) print $1}\' '
+                '| xargs -r kill -9 2>/dev/null; true'
+            )
+        except Exception as e:
+            logger.warning(f'Unable to kill stale scrcpy server: {e}')
 
     def scrcpy_ensure_running(self):
         if not self._scrcpy_alive:
+            if not self._scrcpy_initialized:
+                self.scrcpy_init()
+                return
             with self._scrcpy_control_socket_lock:
                 self._scrcpy_server_start()
 
@@ -67,32 +109,38 @@ class ScrcpyCore(Connection):
             ScrcpyError:
         """
         logger.hr('Scrcpy server start')
-        commands = ScrcpyOptions.command_v120(jar_path=self.config.SCRCPY_FILEPATH_REMOTE)
+        # Never return a frame from the previous server session.
+        self._scrcpy_last_frame = None
+        self._scrcpy_last_frame_time = 0.
+        commands = ScrcpyOptions.command_v120(jar_path=self._scrcpy_jar_remote)
         self._scrcpy_server_stream: _AdbStreamConnection = self.adb.shell(
             commands,
             stream=True,
         )
 
         logger.info('Create server stream')
-        ret = self._scrcpy_server_stream.read(10)
-        # b'Aborted \r\n'
-        # Probably because file not exists
-        if b'Aborted' in ret:
-            raise ScrcpyError('Aborted')
-        if ret == b'[server] E':
-            # [server] ERROR: ...
-            ret += recv_all(self._scrcpy_server_stream)
-            logger.error(ret)
-            # java.lang.IllegalArgumentException: The server version (1.25) does not match the client (...)
-            if b'does not match the client' in ret:
-                raise ScrcpyError('Server version does not match the client')
+        # Do not block on the server stream. On some emulators (e.g. Android 12)
+        # the server logs go to logcat, and stdout stays empty (buffered) while
+        # the server is running, so a blocking read would hang forever.
+        ret = self._scrcpy_receive_from_server_stream()
+        if ret:
+            # b'Aborted \r\n'
+            # Probably because file not exists
+            if b'Aborted' in ret:
+                raise ScrcpyError('Aborted')
+            if ret.startswith(b'[server] E'):
+                # [server] ERROR: ...
+                ret += self._scrcpy_receive_from_server_stream() or b''
+                logger.error(ret)
+                # java.lang.IllegalArgumentException: The server version (1.25) does not match the client (...)
+                if b'does not match the client' in ret:
+                    raise ScrcpyError('Server version does not match the client')
+                else:
+                    raise ScrcpyError('Unknown scrcpy error')
             else:
-                raise ScrcpyError('Unknown scrcpy error')
-        else:
-            # [server] INFO: Device: ...
-            ret += self._scrcpy_receive_from_server_stream()
-            logger.info(ret)
-            pass
+                # [server] INFO: Device: ...
+                ret += self._scrcpy_receive_from_server_stream() or b''
+                logger.info(ret)
 
         logger.info('Create video socket')
         timeout = Timer(3).start()
@@ -168,13 +216,30 @@ class ScrcpyCore(Connection):
                 self._scrcpy_video_socket.close()
             except Exception:
                 pass
+        self._scrcpy_server_stream = None
+        self._scrcpy_control_socket = None
+        self._scrcpy_video_socket = None
 
         logger.info('Scrcpy server stopped')
 
-    def _scrcpy_receive_from_server_stream(self):
+    def _scrcpy_receive_from_server_stream(self, timeout: float = 1.0):
         if self._scrcpy_server_stream is not None:
             try:
-                return self._scrcpy_server_stream.conn.recv(4096)
+                conn = self._scrcpy_server_stream.conn
+                try:
+                    old_timeout = conn.gettimeout()
+                except Exception:
+                    old_timeout = None
+                conn.settimeout(timeout)
+                try:
+                    return conn.recv(4096)
+                finally:
+                    try:
+                        conn.settimeout(old_timeout)
+                    except Exception:
+                        pass
+            except (socket.timeout, TimeoutError):
+                pass
             except Exception:
                 pass
 
